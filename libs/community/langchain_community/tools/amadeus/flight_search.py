@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime as dt
 from typing import Dict, Optional, Type
-
+from amadeus import Client
 from langchain_core.callbacks import CallbackManagerForToolRun
 from pydantic import BaseModel, Field
 
@@ -14,51 +14,29 @@ class FlightSearchSchema(BaseModel):
     """Schema for the AmadeusFlightSearch tool."""
 
     originLocationCode: str = Field(
-        description=(
-            " The three letter International Air Transport "
-            " Association (IATA) Location Identifier for the "
-            " search's origin airport. "
-        )
+        description="IATA code for the origin airport (e.g. BOM)"
     )
     destinationLocationCode: str = Field(
-        description=(
-            " The three letter International Air Transport "
-            " Association (IATA) Location Identifier for the "
-            " search's destination airport. "
-        )
+        description="IATA code for the destination airport (e.g. JFK)"
     )
     departureDateTimeEarliest: str = Field(
-        description=(
-            " The earliest departure datetime from the origin airport "
-            " for the flight search in the following format: "
-            ' "YYYY-MM-DDTHH:MM:SS", where "T" separates the date and time '
-            ' components. For example: "2023-06-09T10:30:00" represents '
-            " June 9th, 2023, at 10:30 AM. "
-        )
+        description='Earliest departure in ISO format: "YYYY-MM-DDTHH:MM:SS"'
     )
     departureDateTimeLatest: str = Field(
-        description=(
-            " The latest departure datetime from the origin airport "
-            " for the flight search in the following format: "
-            ' "YYYY-MM-DDTHH:MM:SS", where "T" separates the date and time '
-            ' components. For example: "2023-06-09T10:30:00" represents '
-            " June 9th, 2023, at 10:30 AM. "
-        )
+        description='Latest departure in ISO format: "YYYY-MM-DDTHH:MM:SS"'
     )
     page_number: int = Field(
         default=1,
-        description="The specific page number of flight results to retrieve",
+        description="Page number of results to fetch (pagination)"
     )
 
 
 class AmadeusFlightSearch(AmadeusBaseTool):
-    """Tool for searching for a single flight between two airports."""
+    """Tool to search flights between two airports in a given datetime window."""
 
     name: str = "single_flight_search"
     description: str = (
-        " Use this tool to search for a single flight between the origin and "
-        " destination airports at a departure between an earliest and "
-        " latest datetime. "
+        "Search for a flight between two airports between earliest and latest departure times."
     )
     args_schema: Type[FlightSearchSchema] = FlightSearchSchema
 
@@ -73,81 +51,63 @@ class AmadeusFlightSearch(AmadeusBaseTool):
     ) -> list:
         try:
             from amadeus import ResponseError
-        except ImportError as e:
-            raise ImportError(
-                "Unable to import amadeus, please install with `pip install amadeus`."
-            ) from e
+        except ImportError:
+            raise ImportError("Install with `pip install amadeus` to use this tool.")
 
+        client = self.client
         RESULTS_PER_PAGE = 10
 
-        # Authenticate and retrieve a client
-        client = self.client
+        earliest = dt.strptime(departureDateTimeEarliest, "%Y-%m-%dT%H:%M:%S")
+        latest = dt.strptime(departureDateTimeLatest, "%Y-%m-%dT%H:%M:%S")
 
-        # Check that earliest and latest dates are in the same day
-        earliestDeparture = dt.strptime(departureDateTimeEarliest, "%Y-%m-%dT%H:%M:%S")
-        latestDeparture = dt.strptime(departureDateTimeLatest, "%Y-%m-%dT%H:%M:%S")
+        if earliest.date() != latest.date():
+            logger.error("Earliest and latest departure must be on the same date.")
+            return []
 
-        if earliestDeparture.date() != latestDeparture.date():
-            logger.error(
-                " Error: Earliest and latest departure dates need to be the "
-                " same date. If you're trying to search for round-trip "
-                " flights, call this function for the outbound flight first, "
-                " and then call again for the return flight. "
-            )
-            return [None]
-
-        # Collect all results from the Amadeus Flight Offers Search API
-        response = None
         try:
             response = client.shopping.flight_offers_search.get(
                 originLocationCode=originLocationCode,
                 destinationLocationCode=destinationLocationCode,
-                departureDate=latestDeparture.strftime("%Y-%m-%d"),
+                departureDate=latest.strftime("%Y-%m-%d"),
                 adults=1,
             )
-        except ResponseError as error:
-            print(error)  # noqa: T201
+        except ResponseError as e:
+            logger.error(f"Amadeus API error: {e}")
+            return []
 
-        # Generate output dictionary
-        output = []
-        if response is not None:
+        results = []
+        if response and hasattr(response, "data"):
             for offer in response.data:
-                itinerary: Dict = {}
-                itinerary["price"] = {}
-                itinerary["price"]["total"] = offer["price"]["total"]
-                currency = offer["price"]["currency"]
-                currency = response.result["dictionaries"]["currencies"][currency]
-                itinerary["price"]["currency"] = {}
-                itinerary["price"]["currency"] = currency
+                itinerary = {
+                    "price": {
+                        "total": offer["price"]["total"],
+                        "currency": response.result["dictionaries"]["currencies"].get(
+                            offer["price"]["currency"], offer["price"]["currency"]
+                        )
+                    },
+                    "segments": []
+                }
 
-                segments = []
                 for segment in offer["itineraries"][0]["segments"]:
-                    flight = {}
-                    flight["departure"] = segment["departure"]
-                    flight["arrival"] = segment["arrival"]
-                    flight["flightNumber"] = segment["number"]
-                    carrier = segment["carrierCode"]
-                    carrier = response.result["dictionaries"]["carriers"][carrier]
-                    flight["carrier"] = carrier
+                    itinerary["segments"].append({
+                        "departure": segment["departure"],
+                        "arrival": segment["arrival"],
+                        "flightNumber": segment["number"],
+                        "carrier": response.result["dictionaries"]["carriers"].get(
+                            segment["carrierCode"], segment["carrierCode"]
+                        )
+                    })
 
-                    segments.append(flight)
+                # Filter by latest departure
+                segment_departure = dt.strptime(
+                    itinerary["segments"][0]["departure"]["at"],
+                    "%Y-%m-%dT%H:%M:%S"
+                )
+                if segment_departure <= latest:
+                    results.append(itinerary)
 
-                itinerary["segments"] = []
-                itinerary["segments"] = segments
+        start_idx = (page_number - 1) * RESULTS_PER_PAGE
+        return results[start_idx:start_idx + RESULTS_PER_PAGE]
 
-                output.append(itinerary)
 
-        # Filter out flights after latest departure time
-        for index, offer in enumerate(output):
-            offerDeparture = dt.strptime(
-                offer["segments"][0]["departure"]["at"], "%Y-%m-%dT%H:%M:%S"
-            )
-
-            if offerDeparture > latestDeparture:
-                output.pop(index)
-
-        # Return the paginated results
-        startIndex = (page_number - 1) * RESULTS_PER_PAGE
-        endIndex = startIndex + RESULTS_PER_PAGE
-
-        return output[startIndex:endIndex]
+AmadeusFlightSearch.model_rebuild()
