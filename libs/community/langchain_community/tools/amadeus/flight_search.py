@@ -57,11 +57,20 @@ class AmadeusFlightSearch(AmadeusBaseTool):
         client = self.client
         RESULTS_PER_PAGE = 10
 
-        earliest = dt.strptime(departureDateTimeEarliest, "%Y-%m-%dT%H:%M:%S")
-        latest = dt.strptime(departureDateTimeLatest, "%Y-%m-%dT%H:%M:%S")
+        # Validate and parse datetimes
+        try:
+            earliest = dt.strptime(departureDateTimeEarliest, "%Y-%m-%dT%H:%M:%S")
+            latest = dt.strptime(departureDateTimeLatest, "%Y-%m-%dT%H:%M:%S")
+        except ValueError as e:
+            logger.error(f"Invalid datetime format: {e}")
+            return []
 
         if earliest.date() != latest.date():
             logger.error("Earliest and latest departure must be on the same date.")
+            return []
+
+        if earliest >= latest:
+            logger.error("Earliest departure time must be before latest departure time.")
             return []
 
         try:
@@ -99,11 +108,16 @@ class AmadeusFlightSearch(AmadeusBaseTool):
                     })
 
                 # Filter by latest departure
-                segment_departure = dt.strptime(
-                    itinerary["segments"][0]["departure"]["at"],
-                    "%Y-%m-%dT%H:%M:%S"
-                )
-                if segment_departure <= latest:
+                try:
+                    segment_departure = dt.strptime(
+                        itinerary["segments"][0]["departure"]["at"],
+                        "%Y-%m-%dT%H:%M:%S"
+                    )
+                except (KeyError, ValueError) as e:
+                    logger.warning(f"Skipping malformed segment: {e}")
+                    continue
+
+                if earliest <= segment_departure <= latest:
                     results.append(itinerary)
 
         start_idx = (page_number - 1) * RESULTS_PER_PAGE
